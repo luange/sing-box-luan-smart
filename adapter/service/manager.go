@@ -56,13 +56,16 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 
 func (m *Manager) Close() error {
 	m.access.Lock()
-	defer m.access.Unlock()
-	if !m.started {
+	if len(m.services) == 0 {
+		m.started = false
+		m.access.Unlock()
 		return nil
 	}
 	m.started = false
 	services := m.services
 	m.services = nil
+	m.serviceByTag = make(map[string]adapter.Service)
+	m.access.Unlock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	var err error
 	for _, service := range services {
@@ -75,7 +78,7 @@ func (m *Manager) Close() error {
 		monitor.Finish()
 		done()
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) Services() []adapter.Service {
@@ -120,10 +123,12 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 		return err
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.started {
+	started := m.started
+	currentStage := m.stage
+	m.access.Unlock()
+	if started {
 		name := "service/" + service.Type() + "[" + service.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
+		for _, stage := range adapter.StartStagesThrough(currentStage) {
 			done := adapter.LogElapsed(m.logger, stage, " ", name)
 			err = adapter.LegacyStart(service, stage)
 			done()
@@ -132,6 +137,8 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 			}
 		}
 	}
+	m.access.Lock()
+	defer m.access.Unlock()
 	if existsService, loaded := m.serviceByTag[tag]; loaded {
 		if m.started {
 			err = existsService.Close()

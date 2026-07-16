@@ -58,13 +58,16 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 
 func (m *Manager) Close() error {
 	m.access.Lock()
-	defer m.access.Unlock()
-	if !m.started {
+	if len(m.inbounds) == 0 {
+		m.started = false
+		m.access.Unlock()
 		return nil
 	}
 	m.started = false
 	inbounds := m.inbounds
 	m.inbounds = nil
+	m.inboundByTag = make(map[string]adapter.Inbound)
+	m.access.Unlock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	var err error
 	for _, inbound := range inbounds {
@@ -77,7 +80,7 @@ func (m *Manager) Close() error {
 		monitor.Finish()
 		done()
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) Inbounds() []adapter.Inbound {
@@ -125,10 +128,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 		return err
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.started {
+	started := m.started
+	currentStage := m.stage
+	m.access.Unlock()
+	if started {
 		name := "inbound/" + inbound.Type() + "[" + inbound.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
+		for _, stage := range adapter.StartStagesThrough(currentStage) {
 			done := adapter.LogElapsed(m.logger, stage, " ", name)
 			err = adapter.LegacyStart(inbound, stage)
 			done()
@@ -137,6 +142,8 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			}
 		}
 	}
+	m.access.Lock()
+	defer m.access.Unlock()
 	if existsInbound, loaded := m.inboundByTag[tag]; loaded {
 		if m.started {
 			err = existsInbound.Close()

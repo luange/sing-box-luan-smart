@@ -143,22 +143,24 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Get("/logs", getLogs(s.ctx, logFactory))
 		r.Get("/traffic", traffic(s.ctx, trafficManager))
 		r.Get("/version", version)
-		r.Mount("/configs", configRouter(s, logFactory))
-		r.Mount("/proxies", proxyRouter(s, s.router))
-		r.Mount("/rules", ruleRouter(s.router, s.dnsRouter))
 		r.Mount("/connections", connectionRouter(s.ctx, s.network, trafficManager))
-		r.Mount("/providers/proxies", proxyProviderRouter(s))
-		r.Mount("/providers/rules", ruleProviderRouter(s.router))
 		r.Mount("/script", scriptRouter())
 		r.Mount("/profile", profileRouter())
-		r.Mount("/cache", cacheRouter(ctx))
-		r.Mount("/dns", dnsRouter(s.dnsRouter))
+		s.setupMetaAPI(r)
+		r.Group(func(dynamic chi.Router) {
+			dynamic.Use(generationLease(s.router))
+			dynamic.Mount("/configs", configRouter(s, logFactory))
+			dynamic.Mount("/proxies", proxyRouter(s, s.router))
+			dynamic.Mount("/rules", ruleRouter(s.router, s.dnsRouter))
+			dynamic.Mount("/providers/proxies", proxyProviderRouter(s))
+			dynamic.Mount("/providers/rules", ruleProviderRouter(s.router))
+			dynamic.Mount("/cache", cacheRouter(ctx))
+			dynamic.Mount("/dns", dnsRouter(s.dnsRouter))
+		})
 
 		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
 			r.Mount("/restart", restartRouter(ctx, logFactory))
 		}
-
-		s.setupMetaAPI(r)
 	})
 	if options.ExternalUI != "" {
 		s.externalUI = filemanager.BasePath(ctx, os.ExpandEnv(options.ExternalUI))
@@ -168,6 +170,21 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		})
 	}
 	return s, nil
+}
+
+func generationLease(router adapter.Router) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			lease, err := adapter.AcquireGeneration(router)
+			if err != nil {
+				render.Status(r, http.StatusServiceUnavailable)
+				render.JSON(w, r, newError(err.Error()))
+				return
+			}
+			defer lease.Release()
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func (s *Server) Name() string {

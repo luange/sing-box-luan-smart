@@ -1,0 +1,11 @@
+proxies:
+  - name: lab-a
+    type: socks5
+    server: 10.254.40.118
+    port: 20001
+    udp: true
+  - name: lab-b
+    type: socks5
+    server: 10.254.40.118
+    port: 20002
+    udp: true

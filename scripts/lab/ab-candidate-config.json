@@ -1,0 +1,29 @@
+{
+  "log": {
+    "level": "error",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "ab-mixed",
+      "listen": "0.0.0.0",
+      "listen_port": 18143,
+      "udp_timeout": "1s"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "0.0.0.0:19143"
+    }
+  }
+}

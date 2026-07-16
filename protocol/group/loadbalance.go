@@ -59,10 +59,12 @@ type LoadBalance struct {
 	interruptExternalConnections bool
 	strategy                     string
 
-	provider       adapter.ProviderManager
-	providers      map[string]adapter.Provider
-	outboundsCache map[string][]adapter.Outbound
-	cancel         context.CancelFunc
+	provider        adapter.ProviderManager
+	providers       map[string]adapter.Provider
+	providerHandles map[string]*list.Element[adapter.ProviderUpdateCallback]
+	outboundsCache  map[string][]adapter.Outbound
+	cancel          context.CancelFunc
+	closing         atomic.Bool
 
 	providerTags    []string
 	exclude         *regexp.Regexp
@@ -95,9 +97,10 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		interruptExternalConnections: options.InterruptExistConnections,
 		strategy:                     strategy,
 
-		provider:       service.FromContext[adapter.ProviderManager](ctx),
-		providers:      make(map[string]adapter.Provider),
-		outboundsCache: make(map[string][]adapter.Outbound),
+		provider:        service.FromContext[adapter.ProviderManager](ctx),
+		providers:       make(map[string]adapter.Provider),
+		providerHandles: make(map[string]*list.Element[adapter.ProviderUpdateCallback]),
+		outboundsCache:  make(map[string][]adapter.Outbound),
 
 		providerTags:    options.Providers,
 		exclude:         (*regexp.Regexp)(options.Exclude),
@@ -113,7 +116,7 @@ func (s *LoadBalance) Start() error {
 		for _, provider := range s.provider.Providers() {
 			providerTags = append(providerTags, provider.Tag())
 			s.providers[provider.Tag()] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
+			s.providerHandles[provider.Tag()] = provider.RegisterCallback(s.onProviderUpdated)
 		}
 		s.providerTags = providerTags
 	} else {
@@ -123,7 +126,7 @@ func (s *LoadBalance) Start() error {
 				return E.New("outbound provider ", i, " not found: ", tag)
 			}
 			s.providers[tag] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
+			s.providerHandles[tag] = provider.RegisterCallback(s.onProviderUpdated)
 		}
 	}
 	if len(s.tags)+len(s.providerTags) == 0 {
@@ -157,9 +160,25 @@ func (s *LoadBalance) PostStart() error {
 }
 
 func (s *LoadBalance) Close() error {
+	if !s.closing.CompareAndSwap(false, true) {
+		return nil
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.unregisterProviderCallbacks()
 	return common.Close(
 		common.PtrOrNil(s.group),
 	)
+}
+
+func (s *LoadBalance) unregisterProviderCallbacks() {
+	for tag, handle := range s.providerHandles {
+		if provider := s.providers[tag]; provider != nil && handle != nil {
+			provider.UnregisterCallback(handle)
+		}
+	}
+	clear(s.providerHandles)
 }
 
 func (s *LoadBalance) Now() string {
@@ -238,6 +257,9 @@ func (s *LoadBalance) NewPacketConnection(ctx context.Context, conn N.PacketConn
 }
 
 func (s *LoadBalance) onProviderUpdated(tag string) error {
+	if s.closing.Load() {
+		return nil
+	}
 	_, loaded := s.providers[tag]
 	if !loaded {
 		return E.New("outbound provider not found: ", tag)

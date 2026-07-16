@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"regexp"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -17,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 )
 
@@ -40,9 +42,11 @@ type Selector struct {
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 
-	provider       adapter.ProviderManager
-	providers      map[string]adapter.Provider
-	outboundsCache map[string][]adapter.Outbound
+	provider        adapter.ProviderManager
+	providers       map[string]adapter.Provider
+	providerHandles map[string]*list.Element[adapter.ProviderUpdateCallback]
+	outboundsCache  map[string][]adapter.Outbound
+	closing         atomic.Bool
 
 	providerTags    []string
 	exclude         *regexp.Regexp
@@ -64,9 +68,10 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: options.InterruptExistConnections,
 
-		provider:       service.FromContext[adapter.ProviderManager](ctx),
-		providers:      make(map[string]adapter.Provider),
-		outboundsCache: make(map[string][]adapter.Outbound),
+		provider:        service.FromContext[adapter.ProviderManager](ctx),
+		providers:       make(map[string]adapter.Provider),
+		providerHandles: make(map[string]*list.Element[adapter.ProviderUpdateCallback]),
+		outboundsCache:  make(map[string][]adapter.Outbound),
 
 		providerTags:    options.Providers,
 		exclude:         (*regexp.Regexp)(options.Exclude),
@@ -90,7 +95,7 @@ func (s *Selector) Start() error {
 		for _, provider := range s.provider.Providers() {
 			providerTags = append(providerTags, provider.Tag())
 			s.providers[provider.Tag()] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
+			s.providerHandles[provider.Tag()] = provider.RegisterCallback(s.onProviderUpdated)
 		}
 		s.providerTags = providerTags
 	} else {
@@ -100,7 +105,7 @@ func (s *Selector) Start() error {
 				return E.New("outbound provider ", i, " not found: ", tag)
 			}
 			s.providers[tag] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
+			s.providerHandles[tag] = provider.RegisterCallback(s.onProviderUpdated)
 		}
 	}
 	if len(s.tags)+len(s.providerTags) == 0 {
@@ -125,6 +130,23 @@ func (s *Selector) Start() error {
 	}
 	s.selected.Store(outbound)
 	return nil
+}
+
+func (s *Selector) Close() error {
+	if !s.closing.CompareAndSwap(false, true) {
+		return nil
+	}
+	s.unregisterProviderCallbacks()
+	return nil
+}
+
+func (s *Selector) unregisterProviderCallbacks() {
+	for tag, handle := range s.providerHandles {
+		if provider := s.providers[tag]; provider != nil && handle != nil {
+			provider.UnregisterCallback(handle)
+		}
+	}
+	clear(s.providerHandles)
 }
 
 func (s *Selector) Now() string {
@@ -203,6 +225,9 @@ func RealTag(detour adapter.Outbound) string {
 }
 
 func (s *Selector) onProviderUpdated(tag string) error {
+	if s.closing.Load() {
+		return nil
+	}
 	_, loaded := s.providers[tag]
 	if !loaded {
 		return E.New(s.Tag(), ": ", "outbound provider not found: ", tag)

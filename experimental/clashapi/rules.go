@@ -31,8 +31,10 @@ type Rule struct {
 
 func getRules(router adapter.Router, dnsRouter adapter.DNSRouter) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var rules []Rule
-		for _, rule := range dnsRouter.Rules() {
+		dnsRules := dnsRouter.Rules()
+		routeRules := router.Rules()
+		rules := make([]Rule, 0, len(dnsRules)+len(routeRules))
+		for _, rule := range dnsRules {
 			rules = append(rules, Rule{
 				Type:    rule.Type(),
 				Payload: rule.String(),
@@ -42,7 +44,7 @@ func getRules(router adapter.Router, dnsRouter adapter.DNSRouter) func(w http.Re
 				UUID:     rule.UUID(),
 			})
 		}
-		for _, rule := range router.Rules() {
+		for _, rule := range routeRules {
 			rules = append(rules, Rule{
 				Type:    rule.Type(),
 				Payload: rule.String(),

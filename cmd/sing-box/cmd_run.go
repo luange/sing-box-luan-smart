@@ -148,7 +148,7 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 	}
 
 	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
 	defer func() {
 		signal.Stop(osSignals)
 		close(osSignals)
@@ -170,6 +170,20 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 	return instance, cancel, nil
 }
 
+func readRunOptions() (option.Options, error) {
+	options, err := readConfigAndMerge()
+	if err != nil {
+		return option.Options{}, err
+	}
+	if disableColor {
+		if options.Log == nil {
+			options.Log = &option.LogOptions{}
+		}
+		options.Log.DisableColor = true
+	}
+	return options, nil
+}
+
 func run() error {
 	optionsList, err := readConfig()
 	if err != nil {
@@ -186,49 +200,41 @@ func run() error {
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
+	instance, cancel, err := create(options)
+	if err != nil {
+		return err
+	}
+	runtimeDebug.FreeOSMemory()
 	for {
-		instance, cancel, createErr := create(options)
-		if createErr != nil {
-			return createErr
+		var reload bool
+		select {
+		case osSignal := <-osSignals:
+			reload = osSignal == syscall.SIGHUP
+		case <-instance.ReloadChan():
+			reload = true
 		}
-		runtimeDebug.FreeOSMemory()
-		for {
-			reloadTag := false
-			select {
-			case osSignal := <-osSignals:
-				if osSignal == syscall.SIGHUP {
-					err = check()
-					if err != nil {
-						log.Error(E.Cause(err, "reload service"))
-						continue
-					}
-					reloadTag = true
-				}
-			case <-instance.ReloadChan():
-				err = check()
-				if err != nil {
-					log.Error(E.Cause(err, "reload service"))
-					continue
-				}
-				reloadTag = true
+		if reload {
+			reloadOptions, readErr := readRunOptions()
+			if readErr != nil {
+				log.Error(E.Cause(readErr, "reload service"))
+				continue
 			}
-			cancel()
-			closeCtx, closed := context.WithCancel(context.Background())
-			go closeMonitor(closeCtx)
-			err = instance.Close()
-			closed()
-			if !reloadTag {
-				if err != nil {
-					log.Error(E.Cause(err, "sing-box did not closed properly"))
-				}
-				return nil
+			if reloadErr := instance.Reload(reloadOptions); reloadErr != nil {
+				log.Error(E.Cause(reloadErr, "reload service"))
+			} else {
+				log.Info("sing-box configuration reloaded")
 			}
-			break
+			continue
 		}
-		options, err = readConfigAndMerge()
+		cancel()
+		closeCtx, closed := context.WithCancel(context.Background())
+		go closeMonitor(closeCtx)
+		err = instance.Close()
+		closed()
 		if err != nil {
-			return err
+			log.Error(E.Cause(err, "sing-box did not closed properly"))
 		}
+		return nil
 	}
 }
 

@@ -59,13 +59,16 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 
 func (m *Manager) Close() error {
 	m.access.Lock()
-	defer m.access.Unlock()
-	if !m.started {
+	if len(m.endpoints) == 0 {
+		m.started = false
+		m.access.Unlock()
 		return nil
 	}
 	m.started = false
 	endpoints := m.endpoints
 	m.endpoints = nil
+	m.endpointByTag = make(map[string]adapter.Endpoint)
+	m.access.Unlock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	var err error
 	for _, endpoint := range endpoints {
@@ -78,7 +81,7 @@ func (m *Manager) Close() error {
 		monitor.Finish()
 		done()
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) Endpoints() []adapter.Endpoint {
@@ -123,10 +126,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 		return err
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.started {
+	started := m.started
+	currentStage := m.stage
+	m.access.Unlock()
+	if started {
 		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
+		for _, stage := range adapter.StartStagesThrough(currentStage) {
 			done := adapter.LogElapsed(m.logger, stage, " ", name)
 			err = adapter.LegacyStart(endpoint, stage)
 			done()
@@ -135,6 +140,8 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			}
 		}
 	}
+	m.access.Lock()
+	defer m.access.Unlock()
 	if existsEndpoint, loaded := m.endpointByTag[tag]; loaded {
 		if m.started {
 			err = existsEndpoint.Close()

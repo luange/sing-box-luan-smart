@@ -31,6 +31,13 @@ var ListStartStages = []StartStage{
 	StartStateStarted,
 }
 
+func StartStagesThrough(stage StartStage) []StartStage {
+	if stage > StartStateStarted {
+		panic("unknown stage")
+	}
+	return ListStartStages[:int(stage)+1]
+}
+
 func (s StartStage) String() string {
 	switch s {
 	case StartStateInitialize:

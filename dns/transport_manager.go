@@ -148,13 +148,18 @@ func (m *TransportManager) startTransports(transports []adapter.DNSTransport) er
 func (m *TransportManager) Close() error {
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
-	if !m.started {
+	if len(m.transports) == 0 {
+		m.started = false
 		m.access.Unlock()
 		return nil
 	}
 	m.started = false
 	transports := m.transports
 	m.transports = nil
+	m.transportByTag = make(map[string]adapter.DNSTransport)
+	m.dependByTag = make(map[string][]string)
+	m.defaultTransport = nil
+	m.fakeIPTransport = nil
 	m.access.Unlock()
 	var err error
 	for _, transport := range transports {
@@ -166,7 +171,7 @@ func (m *TransportManager) Close() error {
 			monitor.Finish()
 		}
 	}
-	return nil
+	return err
 }
 
 func (m *TransportManager) Transports() []adapter.DNSTransport {
@@ -201,6 +206,22 @@ func (m *TransportManager) Remove(tag string) error {
 	if !found {
 		return os.ErrInvalid
 	}
+	dependBy := m.dependByTag[tag]
+	if len(dependBy) > 0 {
+		return E.New("server[", tag, "] is depended by ", strings.Join(dependBy, ", "))
+	}
+	var nextDefault adapter.DNSTransport
+	if m.defaultTransport == transport {
+		for _, candidate := range m.transports {
+			if candidate != transport && candidate.Type() != C.DNSTypeFakeIP {
+				nextDefault = candidate
+				break
+			}
+		}
+		if nextDefault == nil && len(m.transports) > 1 {
+			return E.New("cannot remove the default DNS server while only fakeip servers remain")
+		}
+	}
 	delete(m.transportByTag, tag)
 	index := common.Index(m.transports, func(it adapter.DNSTransport) bool {
 		return it == transport
@@ -211,20 +232,15 @@ func (m *TransportManager) Remove(tag string) error {
 	m.transports = append(m.transports[:index], m.transports[index+1:]...)
 	started := m.started
 	if m.defaultTransport == transport {
-		if len(m.transports) > 0 {
-			nextTransport := m.transports[0]
-			if nextTransport.Type() != C.DNSTypeFakeIP {
-				return E.New("default server cannot be fakeip")
-			}
-			m.defaultTransport = nextTransport
+		if nextDefault != nil {
+			m.defaultTransport = nextDefault
 			m.logger.Info("updated default server to ", m.defaultTransport.Tag())
 		} else {
 			m.defaultTransport = nil
 		}
 	}
-	dependBy := m.dependByTag[tag]
-	if len(dependBy) > 0 {
-		return E.New("server[", tag, "] is depended by ", strings.Join(dependBy, ", "))
+	if m.fakeIPTransport == transport {
+		m.fakeIPTransport = nil
 	}
 	dependencies := transport.Dependencies()
 	for _, dependency := range dependencies {
@@ -237,7 +253,7 @@ func (m *TransportManager) Remove(tag string) error {
 		}
 	}
 	if started {
-		transport.Close()
+		return transport.Close()
 	}
 	return nil
 }
@@ -250,16 +266,20 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
 	if err != nil {
 		return err
 	}
-	m.access.Lock()
-	defer m.access.Unlock()
-	if m.started {
-		for _, stage := range adapter.ListStartStages {
+	m.access.RLock()
+	started := m.started
+	currentStage := m.stage
+	m.access.RUnlock()
+	if started {
+		for _, stage := range adapter.StartStagesThrough(currentStage) {
 			err = adapter.LegacyStart(transport, stage)
 			if err != nil {
 				return E.Cause(err, stage, " dns/", transport.Type(), "[", transport.Tag(), "]")
 			}
 		}
 	}
+	m.access.Lock()
+	defer m.access.Unlock()
 	if existsTransport, loaded := m.transportByTag[tag]; loaded {
 		if m.started {
 			err = common.Close(existsTransport)

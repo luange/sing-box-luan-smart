@@ -31,6 +31,7 @@ type Manager struct {
 	dependByTag             map[string][]string
 	defaultOutbound         adapter.Outbound
 	defaultOutboundFallback func() (adapter.Outbound, error)
+	startedEndpointTags     map[string]bool
 }
 
 func NewManager(logger logger.ContextLogger, registry adapter.OutboundRegistry, endpoint adapter.EndpointManager, defaultTag string) *Manager {
@@ -46,6 +47,15 @@ func NewManager(logger logger.ContextLogger, registry adapter.OutboundRegistry, 
 
 func (m *Manager) Initialize(defaultOutboundFallback func() (adapter.Outbound, error)) {
 	m.defaultOutboundFallback = defaultOutboundFallback
+}
+
+func (m *Manager) UseStartedEndpoints(endpoints []adapter.Endpoint) {
+	m.access.Lock()
+	m.startedEndpointTags = make(map[string]bool, len(endpoints))
+	for _, endpoint := range endpoints {
+		m.startedEndpointTags[endpoint.Tag()] = true
+	}
+	m.access.Unlock()
 }
 
 func (m *Manager) Start(stage adapter.StartStage) error {
@@ -75,8 +85,17 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 			m.defaultOutbound = directOutbound
 		}
 		outbounds := m.outbounds
+		startedEndpointTags := m.startedEndpointTags
 		m.access.Unlock()
-		return m.startOutbounds(append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
+		endpoints := common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })
+		var started map[string]bool
+		if len(startedEndpointTags) > 0 {
+			started = make(map[string]bool, len(startedEndpointTags))
+			for tag := range startedEndpointTags {
+				started[tag] = true
+			}
+		}
+		return m.startOutbounds(append(outbounds, endpoints...), started)
 	} else {
 		outbounds := m.outbounds
 		m.access.Unlock()
@@ -93,9 +112,11 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
+func (m *Manager) startOutbounds(outbounds []adapter.Outbound, started map[string]bool) error {
 	monitor := taskmonitor.New(m.logger, C.StartTimeout)
-	started := make(map[string]bool)
+	if started == nil {
+		started = make(map[string]bool)
+	}
 	for {
 		canContinue := false
 	startOne:
@@ -168,13 +189,17 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 func (m *Manager) Close() error {
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
-	if !m.started {
+	if len(m.outbounds) == 0 {
+		m.started = false
 		m.access.Unlock()
 		return nil
 	}
 	m.started = false
 	outbounds := m.outbounds
 	m.outbounds = nil
+	m.outboundByTag = make(map[string]adapter.Outbound)
+	m.dependByTag = make(map[string][]string)
+	m.defaultOutbound = nil
 	m.access.Unlock()
 	var err error
 	for _, outbound := range outbounds {
@@ -189,7 +214,7 @@ func (m *Manager) Close() error {
 			done()
 		}
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) Outbounds() []adapter.Outbound {
@@ -221,6 +246,10 @@ func (m *Manager) Remove(tag string) error {
 	if !found {
 		return os.ErrInvalid
 	}
+	dependBy := m.dependByTag[tag]
+	if len(dependBy) > 0 {
+		return E.New("outbound[", tag, "] is depended by ", strings.Join(dependBy, ", "))
+	}
 	delete(m.outboundByTag, tag)
 	index := common.Index(m.outbounds, func(it adapter.Outbound) bool {
 		return it == outbound
@@ -237,10 +266,6 @@ func (m *Manager) Remove(tag string) error {
 		} else {
 			m.defaultOutbound = nil
 		}
-	}
-	dependBy := m.dependByTag[tag]
-	if len(dependBy) > 0 {
-		return E.New("outbound[", tag, "] is depended by ", strings.Join(dependBy, ", "))
 	}
 	dependencies := outbound.Dependencies()
 	for _, dependency := range dependencies {
@@ -266,9 +291,13 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
-	if m.started {
+	m.access.RLock()
+	started := m.started
+	currentStage := m.stage
+	m.access.RUnlock()
+	if started {
 		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
+		for _, stage := range adapter.StartStagesThrough(currentStage) {
 			done := adapter.LogElapsed(m.logger, stage, " ", name)
 			err = adapter.LegacyStart(outbound, stage)
 			done()

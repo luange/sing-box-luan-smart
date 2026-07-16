@@ -1,0 +1,50 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "provider-smart-mixed",
+      "listen": "0.0.0.0",
+      "listen_port": 18141,
+      "udp_timeout": "1s"
+    }
+  ],
+  "providers": [
+    {
+      "type": "local",
+      "tag": "lab-provider",
+      "path": "/opt/smart14-provider-lab/provider.yaml"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "SMART-PROVIDER",
+      "providers": [
+        "lab-provider"
+      ],
+      "url": "https://10.254.40.118:19443/generate_204",
+      "probe_interval": "1m",
+      "probe_timeout": "2s",
+      "max_attempts": 2,
+      "attempt_timeout": "2s",
+      "history_path": "/opt/smart14-provider-lab/state/smart-history.json"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "SMART-PROVIDER"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "0.0.0.0:19141",
+      "external_ui": "/opt/smart4-lab/zashboard"
+    }
+  }
+}

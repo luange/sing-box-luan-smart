@@ -40,6 +40,7 @@
 | `urltest`      | [URLTest](./urltest/)           |
 | `naive`        | [NaiveProxy](./naive/)          |
 | `loadbalance`  | [LoadBalance](./loadbalance/)   |
+| `smart`        | [Smart 智能选择](./smart/)        |
 
 #### tag
 

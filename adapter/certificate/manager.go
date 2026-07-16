@@ -59,13 +59,16 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 
 func (m *Manager) Close() error {
 	m.access.Lock()
-	defer m.access.Unlock()
-	if !m.started {
+	if len(m.providers) == 0 {
+		m.started = false
+		m.access.Unlock()
 		return nil
 	}
 	m.started = false
 	providers := m.providers
 	m.providers = nil
+	m.providerByTag = make(map[string]adapter.CertificateProviderService)
+	m.access.Unlock()
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	var err error
 	for _, provider := range providers {
@@ -124,10 +127,12 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 		return err
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.started {
+	started := m.started
+	currentStage := m.stage
+	m.access.Unlock()
+	if started {
 		name := "certificate-provider/" + provider.Type() + "[" + provider.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
+		for _, stage := range adapter.StartStagesThrough(currentStage) {
 			m.logger.Trace(stage, " ", name)
 			startTime := time.Now()
 			err = adapter.LegacyStart(provider, stage)
@@ -137,6 +142,8 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 		}
 	}
+	m.access.Lock()
+	defer m.access.Unlock()
 	if existsProvider, loaded := m.providerByTag[tag]; loaded {
 		if m.started {
 			err = existsProvider.Close()

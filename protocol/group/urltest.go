@@ -46,10 +46,12 @@ type URLTest struct {
 	group                        *URLTestGroup
 	interruptExternalConnections bool
 
-	provider       adapter.ProviderManager
-	providers      map[string]adapter.Provider
-	outboundsCache map[string][]adapter.Outbound
-	cancel         context.CancelFunc
+	provider        adapter.ProviderManager
+	providers       map[string]adapter.Provider
+	providerHandles map[string]*list.Element[adapter.ProviderUpdateCallback]
+	outboundsCache  map[string][]adapter.Outbound
+	cancel          context.CancelFunc
+	closing         atomic.Bool
 
 	providerTags    []string
 	exclude         *regexp.Regexp
@@ -76,9 +78,10 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
 
-		provider:       service.FromContext[adapter.ProviderManager](ctx),
-		providers:      make(map[string]adapter.Provider),
-		outboundsCache: make(map[string][]adapter.Outbound),
+		provider:        service.FromContext[adapter.ProviderManager](ctx),
+		providers:       make(map[string]adapter.Provider),
+		providerHandles: make(map[string]*list.Element[adapter.ProviderUpdateCallback]),
+		outboundsCache:  make(map[string][]adapter.Outbound),
 
 		providerTags:    options.Providers,
 		exclude:         (*regexp.Regexp)(options.Exclude),
@@ -100,7 +103,7 @@ func (s *URLTest) Start() error {
 		for _, provider := range s.provider.Providers() {
 			providerTags = append(providerTags, provider.Tag())
 			s.providers[provider.Tag()] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
+			s.providerHandles[provider.Tag()] = provider.RegisterCallback(s.onProviderUpdated)
 		}
 		s.providerTags = providerTags
 	} else {
@@ -110,7 +113,7 @@ func (s *URLTest) Start() error {
 				return E.New("outbound provider ", i, " not found: ", tag)
 			}
 			s.providers[tag] = provider
-			provider.RegisterCallback(s.onProviderUpdated)
+			s.providerHandles[tag] = provider.RegisterCallback(s.onProviderUpdated)
 		}
 	}
 	if len(s.tags)+len(s.providerTags) == 0 {
@@ -144,9 +147,25 @@ func (s *URLTest) PostStart() error {
 }
 
 func (s *URLTest) Close() error {
+	if !s.closing.CompareAndSwap(false, true) {
+		return nil
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.unregisterProviderCallbacks()
 	return common.Close(
 		common.PtrOrNil(s.group),
 	)
+}
+
+func (s *URLTest) unregisterProviderCallbacks() {
+	for tag, handle := range s.providerHandles {
+		if provider := s.providers[tag]; provider != nil && handle != nil {
+			provider.UnregisterCallback(handle)
+		}
+	}
+	clear(s.providerHandles)
 }
 
 func (s *URLTest) Now() string {
@@ -232,6 +251,9 @@ func (s *URLTest) NewPacketConnection(ctx context.Context, conn N.PacketConn, me
 }
 
 func (s *URLTest) onProviderUpdated(tag string) error {
+	if s.closing.Load() {
+		return nil
+	}
 	_, loaded := s.providers[tag]
 	if !loaded {
 		return E.New("outbound provider not found: ", tag)

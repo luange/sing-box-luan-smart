@@ -70,13 +70,15 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 func (m *Manager) Close() error {
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
-	if !m.started {
+	if len(m.providers) == 0 {
+		m.started = false
 		m.access.Unlock()
 		return nil
 	}
 	m.started = false
 	providers := m.providers
 	m.providers = nil
+	m.providerByTag = make(map[string]adapter.Provider)
 	m.access.Unlock()
 	var err error
 	for _, provider := range providers {
@@ -88,7 +90,7 @@ func (m *Manager) Close() error {
 			monitor.Finish()
 		}
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) Providers() []adapter.Provider {

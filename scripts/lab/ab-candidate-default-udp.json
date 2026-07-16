@@ -1,0 +1,15 @@
+{
+  "log": { "level": "error" },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "default-udp-mixed",
+      "listen": "0.0.0.0",
+      "listen_port": 18145
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": { "final": "direct" }
+}

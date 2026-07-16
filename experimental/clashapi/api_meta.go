@@ -29,7 +29,10 @@ func (s *Server) setupMetaAPI(r chi.Router) {
 		r.Mount("/", middleware.Profiler())
 	}
 	r.Get("/memory", memory(s.ctx))
-	r.Mount("/group", groupRouter(s))
+	r.Group(func(dynamic chi.Router) {
+		dynamic.Use(generationLease(s.router))
+		dynamic.Mount("/group", groupRouter(s))
+	})
 	r.Mount("/upgrade", upgradeRouter(s))
 }
 

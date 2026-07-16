@@ -98,7 +98,7 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
 		endpoint:          service.FromContext[adapter.EndpointManager](ctx),
 		inbound:           service.FromContext[adapter.InboundManager](ctx),
 		outbound:          service.FromContext[adapter.OutboundManager](ctx),
-		needWIFIState:     hasRule(options.Rules, isWIFIRule) || hasDNSRule(dnsOptions.Rules, isWIFIDNSRule),
+		needWIFIState:     RequiresWIFIState(options, dnsOptions),
 	}
 	if options.DefaultNetworkStrategy != nil {
 		if options.DefaultInterface != "" {
@@ -134,6 +134,10 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
 		nm.interfaceMonitor = interfaceMonitor
 	}
 	return nm, nil
+}
+
+func RequiresWIFIState(options option.RouteOptions, dnsOptions option.DNSOptions) bool {
+	return hasRule(options.Rules, isWIFIRule) || hasDNSRule(dnsOptions.Rules, isWIFIDNSRule)
 }
 
 func (r *NetworkManager) Start(stage adapter.StartStage) error {
