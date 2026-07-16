@@ -2,9 +2,8 @@ package rule
 
 import (
 	"context"
-	"io"
-	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
@@ -81,12 +80,7 @@ func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.H
 }
 
 func (s *LocalRuleSet) reloadFile(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	content, err := io.ReadAll(file)
-	file.Close()
+	content, err := filemanager.ReadFile(s.ctx, path)
 	if err != nil {
 		return err
 	}
@@ -94,11 +88,7 @@ func (s *LocalRuleSet) reloadFile(path string) error {
 	if err != nil {
 		return err
 	}
-	fs, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	s.lastUpdated = fs.ModTime()
+	s.lastUpdated = time.Now()
 	return nil
 }
 

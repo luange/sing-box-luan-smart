@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime/debug"
 	"sync"
@@ -44,6 +45,8 @@ type Box struct {
 	ctx                 context.Context
 	options             option.Options
 	createdAt           time.Time
+	debugOptions        option.DebugOptions
+	debugHTTPServer     *http.Server
 	logFactory          log.Factory
 	logger              log.ContextLogger
 	network             *route.NetworkManager
@@ -155,7 +158,9 @@ func New(options Options) (_ *Box, err error) {
 	}
 
 	experimentalOptions := common.PtrValueOrDefault(options.Experimental)
-	if err = applyDebugOptions(common.PtrValueOrDefault(experimentalOptions.Debug)); err != nil {
+	debugOptions := common.PtrValueOrDefault(experimentalOptions.Debug)
+	err = checkDebugOptions(debugOptions)
+	if err != nil {
 		return nil, err
 	}
 	needCacheFile := experimentalOptions.CacheFile != nil && experimentalOptions.CacheFile.Enabled || options.PlatformLogWriter != nil
@@ -190,9 +195,9 @@ func New(options Options) (_ *Box, err error) {
 		len(certificateOptions.Certificate) > 0 ||
 		len(certificateOptions.CertificatePath) > 0 ||
 		len(certificateOptions.CertificateDirectoryPath) > 0 {
-		certificateStore, certificateErr := certificate.NewStore(logFactory.NewLogger("certificate"), certificateOptions)
-		if certificateErr != nil {
-			return nil, certificateErr
+		certificateStore, err := certificate.NewStore(ctx, logFactory.NewLogger("certificate"), certificateOptions)
+		if err != nil {
+			return nil, err
 		}
 		service.MustRegister[adapter.CertificateStore](ctx, certificateStore)
 		internalServices = append(internalServices, certificateStore)
@@ -262,6 +267,7 @@ func New(options Options) (_ *Box, err error) {
 		ctx:                 ctx,
 		options:             options.Options,
 		createdAt:           createdAt,
+		debugOptions:        debugOptions,
 		logFactory:          logFactory,
 		logger:              logFactory.Logger(),
 		network:             networkManager,
@@ -399,9 +405,15 @@ func New(options Options) (_ *Box, err error) {
 		}
 	}
 	if ntpOptions.Enabled {
-		ntpDialer, ntpErr := dialer.New(ctx, ntpOptions.DialerOptions, ntpOptions.ServerIsDomain())
-		if ntpErr != nil {
-			return nil, E.Cause(ntpErr, "create NTP service")
+		if ntpOptions.WriteToSystem {
+			err = adapter.CheckSecurityFeature(ctx, "NTP `write_to_system`")
+			if err != nil {
+				return nil, err
+			}
+		}
+		ntpDialer, err := dialer.New(ctx, ntpOptions.DialerOptions, ntpOptions.ServerIsDomain())
+		if err != nil {
+			return nil, E.Cause(err, "create NTP service")
 		}
 		ntpService := ntp.NewService(ntp.Options{
 			Context:       ctx,
@@ -467,6 +479,11 @@ func (s *Box) preStart() error {
 	monitor.Finish()
 	if err != nil {
 		return E.Cause(err, "start logger")
+	}
+	applyDebugOptions(s.debugOptions)
+	s.debugHTTPServer, err = startDebugHTTPServer(s.debugOptions)
+	if err != nil {
+		return err
 	}
 	err = adapter.StartNamed(s.logger, adapter.StartStateInitialize, s.internalService) // cache-file clash-api v2ray-api
 	if err != nil {
@@ -599,6 +616,12 @@ func (s *Box) Close() error {
 	}
 	s.started = false
 	var err error
+	if s.debugHTTPServer != nil {
+		err = E.Append(err, s.debugHTTPServer.Close(), func(err error) error {
+			return E.Cause(err, "close debug HTTP server")
+		})
+		s.debugHTTPServer = nil
+	}
 	for _, closeItem := range []struct {
 		name    string
 		service adapter.Lifecycle

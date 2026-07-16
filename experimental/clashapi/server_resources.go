@@ -23,13 +23,16 @@ func (s *Server) checkAndDownloadExternalUI(update bool) error {
 	if s.externalUI == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(s.externalUI)
+	entries, err := filemanager.ReadDir(s.ctx, s.externalUI)
 	if err != nil {
-		filemanager.MkdirAll(s.ctx, s.externalUI, 0o755)
+		if mkdirErr := filemanager.MkdirAll(s.ctx, s.externalUI, 0o755); mkdirErr != nil {
+			return mkdirErr
+		}
 	}
 	if len(entries) != 0 && s.lastUpdated.IsZero() {
-		info, _ := os.Stat(s.externalUI)
-		s.lastUpdated = info.ModTime()
+		if info, statErr := os.Stat(s.externalUI); statErr == nil {
+			s.lastUpdated = info.ModTime()
+		}
 	}
 	if len(entries) == 0 || update {
 		if len(entries) == 0 && s.lastEtag != "" {
@@ -195,7 +198,7 @@ func downloadZIPEntry(ctx context.Context, zipFile *zip.File, savePath string) e
 }
 
 func removeAllInDirectory(ctx context.Context, directory string) {
-	dirEntries, err := os.ReadDir(directory)
+	dirEntries, err := filemanager.ReadDir(ctx, directory)
 	if err != nil {
 		return
 	}
