@@ -10,8 +10,6 @@ import (
 	"os"
 	"reflect"
 	"strings"
-	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/sagernet/sing-box/common/dialer"
@@ -28,10 +26,6 @@ import (
 	"go4.org/netipx"
 )
 
-const networkPauseGracePeriod = time.Second
-
-var errNetworkPaused = E.New("network is paused")
-
 type Endpoint struct {
 	options        EndpointOptions
 	peers          []peerConfig
@@ -43,11 +37,6 @@ type Endpoint struct {
 	allowedIPs     *device.AllowedIPs
 	pause          pause.Manager
 	pauseCallback  *list.Element[pause.Callback]
-	deviceAccess   sync.Mutex
-	pauseAccess    sync.Mutex
-	pauseUpdated   chan struct{}
-	done           chan struct{}
-	closeOnce      sync.Once
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -112,18 +101,21 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 		options.MTU = 1408
 	}
 	deviceOptions := DeviceOptions{
-		Context:        options.Context,
-		Logger:         options.Logger,
-		System:         options.System,
-		GSO:            options.GSO,
-		Handler:        options.Handler,
-		UDPTimeout:     options.UDPTimeout,
-		ICMPTimeout:    options.ICMPTimeout,
-		CreateDialer:   options.CreateDialer,
-		Name:           options.Name,
-		MTU:            options.MTU,
-		Address:        options.Address,
-		AllowedAddress: allowedAddresses,
+		Context:         options.Context,
+		Logger:          options.Logger,
+		System:          options.System,
+		Handler:         options.Handler,
+		UDPTimeout:      options.UDPTimeout,
+		ICMPTimeout:     options.ICMPTimeout,
+		UDPMapping:      options.UDPMapping,
+		UDPFiltering:    options.UDPFiltering,
+		UDPNATMax:       options.UDPNATMax,
+		InterfaceFinder: options.InterfaceFinder,
+		CreateDialer:    options.CreateDialer,
+		Name:            options.Name,
+		MTU:             options.MTU,
+		Address:         options.Address,
+		AllowedAddress:  allowedAddresses,
 	}
 	tunDevice, err := NewDevice(deviceOptions)
 	if err != nil {
@@ -136,8 +128,6 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 		allowedAddress: allowedAddresses,
 		tunDevice:      tunDevice,
 		returnDevice:   &returnDeviceWrapper{Device: tunDevice},
-		pauseUpdated:   make(chan struct{}),
-		done:           make(chan struct{}),
 	}, nil
 }
 
@@ -162,13 +152,17 @@ func (e *Endpoint) Start(resolve bool) error {
 		return nil
 	}
 	var bind conn.Bind
-	wgListener, isWgListener := common.Cast[dialer.WireGuardListener](e.options.Dialer)
-	if isWgListener {
-		stdBind := conn.NewStdNetBind(wgListener.WireGuardControl())
+	wireGuardListener, isWireGuardListener := common.Cast[dialer.WireGuardListener](e.options.Dialer)
+	if isWireGuardListener {
+		wireGuardControl, _ := wireGuardListener.WireGuardControl()
+		standardBind := conn.NewStdNetBind(wireGuardControl).(*conn.StdNetBind)
 		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
-			stdBind.(*conn.StdNetBind).SetSinglePeerMode()
+			standardBind.SetSinglePeerMode()
 		}
-		bind = stdBind
+		if e.options.EgressPool != nil {
+			standardBind.SetEgressProvider(e.options.EgressPool)
+		}
+		bind = standardBind
 	} else {
 		var (
 			isConnect   bool
@@ -182,7 +176,7 @@ func (e *Endpoint) Start(resolve bool) error {
 		}
 		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, isConnect, connectAddr, reserved)
 	}
-	if isWgListener || len(e.peers) > 1 {
+	if isWireGuardListener || len(e.peers) > 1 {
 		for _, peer := range e.peers {
 			if peer.reserved != [3]uint8{} {
 				bind.SetReservedForEndpoint(peer.endpoint, peer.reserved)
@@ -213,9 +207,7 @@ func (e *Endpoint) Start(resolve bool) error {
 		wgDevice.Close()
 		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
 	}
-	e.deviceAccess.Lock()
 	e.device = wgDevice
-	e.deviceAccess.Unlock()
 	e.pause = service.FromContext[pause.Manager](e.options.Context)
 	if e.pause != nil {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
@@ -228,9 +220,6 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	if err := e.ensureDeviceStarted(ctx); err != nil {
-		return nil, err
-	}
 	return e.tunDevice.DialContext(ctx, network, destination)
 }
 
@@ -238,101 +227,24 @@ func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	if err := e.ensureDeviceStarted(ctx); err != nil {
-		return nil, err
-	}
 	return e.tunDevice.ListenPacket(ctx, destination)
 }
 
-func (e *Endpoint) ensureDeviceStarted(ctx context.Context) error {
-	if err := e.waitNetworkActive(ctx); err != nil {
-		return err
-	}
-	e.deviceAccess.Lock()
-	defer e.deviceAccess.Unlock()
-	select {
-	case <-e.done:
-		return net.ErrClosed
-	default:
-	}
-	if e.device == nil {
-		return net.ErrClosed
-	}
-	if e.pause != nil && e.pause.IsPaused() {
-		return errNetworkPaused
-	}
-	return e.device.Up()
-}
-
-func (e *Endpoint) waitNetworkActive(ctx context.Context) error {
-	pauseManager := e.pause
-	if pauseManager == nil || !pauseManager.IsPaused() {
-		return nil
-	}
-	timer := time.NewTimer(networkPauseGracePeriod)
-	defer timer.Stop()
-	for pauseManager.IsPaused() {
-		e.pauseAccess.Lock()
-		updated := e.pauseUpdated
-		e.pauseAccess.Unlock()
-		if !pauseManager.IsPaused() {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-e.options.Context.Done():
-			return net.ErrClosed
-		case <-e.done:
-			return net.ErrClosed
-		case <-updated:
-		case <-timer.C:
-			if pauseManager.IsPaused() {
-				return errNetworkPaused
-			}
-		}
-	}
-	return nil
-}
-
-func (e *Endpoint) notifyPauseUpdated() {
-	e.pauseAccess.Lock()
-	close(e.pauseUpdated)
-	e.pauseUpdated = make(chan struct{})
-	e.pauseAccess.Unlock()
-}
-
-func (e *Endpoint) BindUpdate() error {
-	if e.pause != nil && e.pause.IsPaused() {
-		return nil
-	}
-	e.deviceAccess.Lock()
-	defer e.deviceAccess.Unlock()
-	if e.device == nil {
-		return net.ErrClosed
-	}
-	if e.pause != nil && e.pause.IsPaused() {
-		return nil
-	}
-	return e.device.BindUpdate()
-}
-
 func (e *Endpoint) Close() error {
-	e.closeOnce.Do(func() {
-		close(e.done)
-		if e.pauseCallback != nil {
-			e.pause.UnregisterCallback(e.pauseCallback)
-			e.pauseCallback = nil
-		}
-		e.deviceAccess.Lock()
-		defer e.deviceAccess.Unlock()
-		if e.device != nil {
-			e.device.Down()
-			e.device.Close()
-			e.device = nil
-		}
-	})
-	return nil
+	if e.pauseCallback != nil {
+		e.pause.UnregisterCallback(e.pauseCallback)
+		e.pauseCallback = nil
+	}
+	if e.options.EgressPool != nil {
+		e.options.EgressPool.Close()
+	}
+	if e.device != nil {
+		e.device.Down()
+		e.device.Close()
+		e.device = nil
+		return nil
+	}
+	return e.tunDevice.Close()
 }
 
 func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
@@ -343,24 +255,11 @@ func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {
-	defer e.notifyPauseUpdated()
-	e.deviceAccess.Lock()
-	defer e.deviceAccess.Unlock()
-	if e.device == nil {
-		return
-	}
-	var err error
 	switch event {
 	case pause.EventDevicePaused, pause.EventNetworkPause:
-		err = e.device.Down()
+		e.device.Down()
 	case pause.EventDeviceWake, pause.EventNetworkWake:
-		if e.pause.IsPaused() {
-			return
-		}
-		err = e.device.Up()
-	}
-	if err != nil {
-		e.options.Logger.Warn(E.Cause(err, "update WireGuard device state"))
+		e.device.Up()
 	}
 }
 

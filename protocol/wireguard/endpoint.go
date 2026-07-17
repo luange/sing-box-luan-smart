@@ -14,7 +14,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/wireguard"
-	tun "github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -27,7 +27,6 @@ import (
 var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
-	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
 )
 
 func RegisterEndpoint(registry *endpoint.Registry) {
@@ -36,14 +35,13 @@ func RegisterEndpoint(registry *endpoint.Registry) {
 
 type Endpoint struct {
 	endpoint.Adapter
-	ctx                  context.Context
-	router               adapter.Router
-	dnsRouter            adapter.DNSRouter
-	logger               logger.ContextLogger
-	localAddresses       []netip.Prefix
-	endpoint             *wireguard.Endpoint
-	started              atomic.Bool
-	innerDNSQueryOptions adapter.DNSQueryOptions
+	ctx            context.Context
+	router         adapter.Router
+	dnsRouter      adapter.DNSRouter
+	logger         logger.ContextLogger
+	localAddresses []netip.Prefix
+	endpoint       *wireguard.Endpoint
+	started        atomic.Bool
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardEndpointOptions) (adapter.Endpoint, error) {
@@ -75,19 +73,37 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
-	gso := options.System
-	if options.GSO != nil {
-		gso = *options.GSO
+	networkManager := service.FromContext[adapter.NetworkManager](ctx)
+	var egressPool *tun.UDPEgressPool
+	wireGuardListener, isWireGuardListener := common.Cast[dialer.WireGuardListener](outboundDialer)
+	if isWireGuardListener {
+		anchorControl, egressEnabled := wireGuardListener.WireGuardControl()
+		if egressEnabled {
+			egressPool = tun.NewUDPEgressPool(tun.UDPEgressPoolOptions{
+				Logger:           logger,
+				Control:          anchorControl,
+				InterfaceFinder:  networkManager.InterfaceFinder(),
+				InterfaceMonitor: networkManager.InterfaceMonitor(),
+				ExcludeInterface: options.Name,
+				IsExempt: func() bool {
+					return networkManager.AutoRedirectOutputMark() != 0
+				},
+			})
+		}
 	}
 	wgEndpoint, err := wireguard.NewEndpoint(wireguard.EndpointOptions{
-		Context:     ctx,
-		Logger:      logger,
-		System:      options.System,
-		GSO:         gso,
-		Handler:     ep,
-		UDPTimeout:  udpTimeout,
-		ICMPTimeout: C.ICMPTimeout,
-		Dialer:      outboundDialer,
+		Context:         ctx,
+		Logger:          logger,
+		System:          options.System,
+		Handler:         ep,
+		UDPTimeout:      udpTimeout,
+		ICMPTimeout:     C.ICMPTimeout,
+		UDPMapping:      tun.NATMapping(options.UDPMapping),
+		UDPFiltering:    tun.NATFiltering(options.UDPFiltering),
+		UDPNATMax:       options.UDPNATMax,
+		InterfaceFinder: networkManager.InterfaceFinder(),
+		EgressPool:      egressPool,
+		Dialer:          outboundDialer,
 		CreateDialer: func(interfaceName string) N.Dialer {
 			return common.Must1(dialer.NewDefault(ctx, option.DialerOptions{
 				BindInterface: interfaceName,
@@ -121,13 +137,6 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	ep.endpoint = wgEndpoint
-	if options.InnerDomainResolver != nil {
-		innerDNSOpts, err := adapter.DNSQueryOptionsFrom(ctx, options.InnerDomainResolver)
-		if err != nil {
-			return nil, E.Cause(err, "inner domain resolver")
-		}
-		ep.innerDNSQueryOptions = innerDNSOpts
-	}
 	return ep, nil
 }
 
@@ -148,16 +157,6 @@ func (w *Endpoint) Start(stage adapter.StartStage) error {
 func (w *Endpoint) Close() error {
 	w.started.Store(false)
 	return w.endpoint.Close()
-}
-
-func (w *Endpoint) InterfaceUpdated() {
-	if !w.started.Load() {
-		return
-	}
-	err := w.endpoint.BindUpdate()
-	if err != nil {
-		w.logger.Warn(E.Cause(err, "update WireGuard bind after network change"))
-	}
 }
 
 func (w *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
@@ -251,7 +250,7 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 		return nil, E.New("WireGuard is not ready yet")
 	}
 	if destination.IsDomain() {
-		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, w.innerDNSQueryOptions)
+		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +267,7 @@ func (w *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 		return nil, netip.Addr{}, E.New("WireGuard is not ready yet")
 	}
 	if destination.IsDomain() {
-		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, w.innerDNSQueryOptions)
+		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
 			return nil, netip.Addr{}, err
 		}

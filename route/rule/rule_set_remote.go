@@ -1,50 +1,57 @@
 package rule
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/hash"
+	"github.com/sagernet/sing-box/common/srs"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
-	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
-	"github.com/sagernet/sing/common/rw"
+	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
-	"github.com/sagernet/sing/service/filemanager"
 	"github.com/sagernet/sing/service/pause"
+
+	"go4.org/netipx"
 )
 
 var _ adapter.RuleSet = (*RemoteRuleSet)(nil)
 
 type RemoteRuleSet struct {
-	abstractRuleSet
+	ctx            context.Context
 	cancel         context.CancelFunc
+	logger         logger.ContextLogger
 	outbound       adapter.OutboundManager
-	options        option.RemoteRuleSet
+	tag            string
+	url            string
+	options        option.RuleSet
 	updateInterval time.Duration
 	httpClient     *http.Client
-	hash           hash.HashType
+	access         sync.RWMutex
+	rules          []adapter.HeadlessRule
+	metadata       adapter.RuleSetMetadata
+	lastUpdated    time.Time
 	lastEtag       string
 	cacheFile      adapter.CacheFile
 	pauseManager   pause.Manager
+	callbacks      list.List[adapter.RuleSetUpdateCallback]
+	refs           atomic.Int32
 }
 
-func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, options option.RuleSet) (*RemoteRuleSet, error) {
+func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*RemoteRuleSet, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	var path string
-	if options.Path != "" {
-		path = filemanager.BasePath(ctx, options.Path)
-		path, _ = filepath.Abs(path)
-	}
 	var updateInterval time.Duration
 	if options.RemoteOptions.UpdateInterval > 0 {
 		updateInterval = time.Duration(options.RemoteOptions.UpdateInterval)
@@ -52,19 +59,20 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, options 
 		updateInterval = 24 * time.Hour
 	}
 	return &RemoteRuleSet{
-		abstractRuleSet: abstractRuleSet{
-			ctx:    ctx,
-			logger: logger,
-			tag:    options.Tag,
-			path:   path,
-			format: options.Format,
-		},
-		outbound:       service.FromContext[adapter.OutboundManager](ctx),
+		ctx:            ctx,
 		cancel:         cancel,
-		options:        options.RemoteOptions,
+		outbound:       service.FromContext[adapter.OutboundManager](ctx),
+		logger:         logger,
+		tag:            tag,
+		url:            strings.ReplaceAll(options.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag),
+		options:        options,
 		updateInterval: updateInterval,
 		pauseManager:   service.FromContext[pause.Manager](ctx),
 	}, nil
+}
+
+func (s *RemoteRuleSet) Name() string {
+	return s.tag
 }
 
 func (s *RemoteRuleSet) String() string {
@@ -79,8 +87,16 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	if err = s.loadCacheFile(); err != nil {
-		s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+	if s.cacheFile != nil {
+		if savedSet := s.cacheFile.LoadRuleSet(s.tag); savedSet != nil {
+			err = s.loadBytes(savedSet.Content)
+			if err != nil {
+				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+			} else {
+				s.lastUpdated = savedSet.LastUpdated
+				s.lastEtag = savedSet.LastEtag
+			}
+		}
 	}
 	if s.lastUpdated.IsZero() {
 		err = s.fetch(ctx, true)
@@ -91,29 +107,104 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	return nil
 }
 
-func (s *RemoteRuleSet) update() {
-	ctx := log.ContextWithNewID(s.ctx)
-	err := s.fetch(ctx, false)
-	if err != nil {
-		s.logger.ErrorContext(ctx, "fetch rule-set ", s.tag, ": ", err)
-	} else if s.refs.Load() == 0 {
+func (s *RemoteRuleSet) Metadata() adapter.RuleSetMetadata {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return s.metadata
+}
+
+func (s *RemoteRuleSet) ExtractIPSet() []*netipx.IPSet {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return common.FlatMap(s.rules, extractIPSetFromRule)
+}
+
+func (s *RemoteRuleSet) IncRef() {
+	s.refs.Add(1)
+}
+
+func (s *RemoteRuleSet) DecRef() {
+	if s.refs.Add(-1) < 0 {
+		panic("rule-set: negative refs")
+	}
+}
+
+func (s *RemoteRuleSet) Cleanup() {
+	if s.refs.Load() == 0 {
 		s.rules = nil
 	}
 }
 
-func (s *RemoteRuleSet) Update(ctx context.Context) error {
-	err := s.fetch(log.ContextWithNewID(ctx), false)
+func (s *RemoteRuleSet) RegisterCallback(callback adapter.RuleSetUpdateCallback) *list.Element[adapter.RuleSetUpdateCallback] {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.callbacks.PushBack(callback)
+}
+
+func (s *RemoteRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetUpdateCallback]) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.callbacks.Remove(element)
+}
+
+func (s *RemoteRuleSet) loadBytes(content []byte) error {
+	var (
+		ruleSet option.PlainRuleSetCompat
+		err     error
+	)
+	switch s.options.Format {
+	case C.RuleSetFormatSource:
+		ruleSet, err = json.UnmarshalExtended[option.PlainRuleSetCompat](content)
+		if err != nil {
+			return err
+		}
+	case C.RuleSetFormatBinary:
+		ruleSet, err = srs.Read(bytes.NewReader(content), false)
+		if err != nil {
+			return err
+		}
+	default:
+		return E.New("unknown rule-set format: ", s.options.Format)
+	}
+	plainRuleSet, err := ruleSet.Upgrade()
 	if err != nil {
 		return err
-	} else if s.refs.Load() == 0 {
-		s.rules = nil
+	}
+	rules := make([]adapter.HeadlessRule, len(plainRuleSet.Rules))
+	for i, ruleOptions := range plainRuleSet.Rules {
+		rules[i], err = NewHeadlessRule(s.ctx, ruleOptions)
+		if err != nil {
+			return E.Cause(err, "parse rule_set.rules.[", i, "]")
+		}
+	}
+	metadata := buildRuleSetMetadata(plainRuleSet.Rules)
+	err = validateRuleSetMetadataUpdate(s.ctx, s.tag, metadata)
+	if err != nil {
+		return err
+	}
+	s.access.Lock()
+	s.metadata = metadata
+	s.rules = rules
+	callbacks := s.callbacks.Array()
+	s.access.Unlock()
+	for _, callback := range callbacks {
+		callback(s)
 	}
 	return nil
 }
 
+func (s *RemoteRuleSet) updateOnce() {
+	err := s.fetch(s.ctx, false)
+	if err != nil {
+		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
+	} else if s.refs.Load() == 0 {
+		s.rules = nil
+	}
+}
+
 func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
-	s.logger.DebugContext(ctx, "updating rule-set ", s.tag, " from URL: ", s.options.URL)
-	request, err := http.NewRequest("GET", s.options.URL, nil)
+	s.logger.Debug("updating rule-set ", s.tag, " from URL: ", s.url)
+	request, err := http.NewRequest("GET", s.url, nil)
 	if err != nil {
 		return err
 	}
@@ -132,18 +223,18 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	case http.StatusOK:
 	case http.StatusNotModified:
 		s.lastUpdated = time.Now()
-		if s.path != "" {
-			os.Chtimes(s.path, s.lastUpdated, s.lastUpdated)
-		}
 		if s.cacheFile != nil {
-			if savedRuleSet := s.cacheFile.LoadRuleSet(s.tag); savedRuleSet != nil {
+			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
+			if savedRuleSet != nil {
 				savedRuleSet.LastUpdated = s.lastUpdated
-				if err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet); err != nil {
+				err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet)
+				if err != nil {
 					s.logger.Error("save rule-set updated time: ", err)
+					return nil
 				}
 			}
 		}
-		s.logger.InfoContext(ctx, "update rule-set ", s.tag, ": not modified")
+		s.logger.Info("update rule-set ", s.tag, ": not modified")
 		return nil
 	default:
 		return E.New("unexpected status: ", response.Status)
@@ -152,7 +243,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
-	err = s.loadBytes(content, s)
+	err = s.loadBytes(content)
 	if err != nil {
 		return err
 	}
@@ -161,40 +252,33 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 		s.lastEtag = eTagHeader
 	}
 	s.lastUpdated = time.Now()
-	if s.path != "" {
-		s.saveCacheFile(content)
-	}
 	if s.cacheFile != nil {
-		savedRuleSet := &adapter.SavedBinary{
+		err = s.cacheFile.SaveRuleSet(s.tag, &adapter.SavedBinary{
 			LastUpdated: s.lastUpdated,
+			Content:     content,
 			LastEtag:    s.lastEtag,
-		}
-		if s.path != "" {
-			savedRuleSet.Hash = s.hash
-		} else {
-			savedRuleSet.Content = content
-		}
-		if err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet); err != nil {
+		})
+		if err != nil {
 			s.logger.Error("save rule-set cache: ", err)
 		}
 	}
-	s.logger.InfoContext(ctx, "updated rule-set ", s.tag)
+	s.logger.Info("updated rule-set ", s.tag)
 	return nil
 }
 
 func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
 	httpClientManager := service.FromContext[adapter.HTTPClientManager](s.ctx)
-	if s.options.HTTPClient != nil && !s.options.HTTPClient.IsEmpty() {
-		if s.options.DownloadDetour != "" { //nolint:staticcheck
+	if s.options.RemoteOptions.HTTPClient != nil && !s.options.RemoteOptions.HTTPClient.IsEmpty() {
+		if s.options.RemoteOptions.DownloadDetour != "" { //nolint:staticcheck
 			return nil, E.New("http_client is conflict with deprecated download_detour field")
 		}
-		return httpClientManager.ResolveTransport(s.ctx, s.logger, *s.options.HTTPClient)
+		return httpClientManager.ResolveTransport(s.ctx, s.logger, *s.options.RemoteOptions.HTTPClient)
 	}
-	if s.options.DownloadDetour != "" { //nolint:staticcheck
+	if s.options.RemoteOptions.DownloadDetour != "" { //nolint:staticcheck
 		deprecated.Report(s.ctx, deprecated.OptionLegacyRuleSetDownloadDetour)
 		return httpClientManager.ResolveTransport(s.ctx, s.logger, option.HTTPClientOptions{
 			DialerOptions: option.DialerOptions{
-				Detour: s.options.DownloadDetour, //nolint:staticcheck
+				Detour: s.options.RemoteOptions.DownloadDetour, //nolint:staticcheck
 			},
 			DisableEmptyDirectCheck: true,
 		})
@@ -206,85 +290,26 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
 	return defaultTransport, nil
 }
 
-func (s *RemoteRuleSet) loadCacheFile() error {
-	var content []byte
-	var lastUpdated time.Time
-	var lastEtag string
-	var savedSet *adapter.SavedBinary
-	if s.cacheFile != nil {
-		if savedSet = s.cacheFile.LoadRuleSet(s.tag); savedSet != nil {
-			s.hash = savedSet.Hash
-		}
-	}
-	if s.path != "" {
-		exists, err := pathExists(s.path)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return nil
-		}
-		file, err := os.Open(s.path)
-		if err != nil {
-			return err
-		}
-		content, err = io.ReadAll(file)
-		file.Close()
-		if err != nil {
-			return err
-		}
-		if savedSet != nil {
-			if !s.hash.Equal(hash.MakeHash(content)) {
-				return E.New("load rule-set cache file failed: validation failed")
-			}
-			lastUpdated = savedSet.LastUpdated
-			lastEtag = savedSet.LastEtag
-		} else {
-			fs, err := os.Stat(s.path)
-			if err != nil {
-				return err
-			}
-			lastUpdated = fs.ModTime()
-		}
-	} else if savedSet != nil && len(savedSet.Content) > 0 {
-		content = savedSet.Content
-		lastUpdated = savedSet.LastUpdated
-		lastEtag = savedSet.LastEtag
-	} else {
-		return nil
-	}
-	if err := s.loadBytes(content, s); err != nil {
-		return err
-	}
-	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
-	return nil
-}
-
-func pathExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if rw.IsDir(path) {
-		return false, E.New("rule_set path is a directory: ", path)
-	}
-	return false, err
-}
-
-func (s *RemoteRuleSet) saveCacheFile(contentRaw []byte) {
-	s.hash = hash.MakeHash(contentRaw)
-	dir := filepath.Dir(s.path)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		filemanager.MkdirAll(s.ctx, dir, 0o755)
-	}
-	filemanager.WriteFile(s.ctx, s.path, []byte(contentRaw), 0o666)
-}
-
 func (s *RemoteRuleSet) Close() error {
 	s.rules = nil
 	s.cancel()
 	return nil
+}
+
+func (s *RemoteRuleSet) Match(metadata *adapter.InboundContext) bool {
+	return !s.matchStates(metadata).isEmpty()
+}
+
+func (s *RemoteRuleSet) matchStates(metadata *adapter.InboundContext) ruleMatchStateSet {
+	return s.matchStatesWithBase(metadata, 0)
+}
+
+func (s *RemoteRuleSet) matchStatesWithBase(metadata *adapter.InboundContext, base ruleMatchState) ruleMatchStateSet {
+	var stateSet ruleMatchStateSet
+	for _, rule := range s.rules {
+		nestedMetadata := *metadata
+		nestedMetadata.ResetRuleMatchCache()
+		stateSet = stateSet.merge(matchHeadlessRuleStatesWithBase(rule, &nestedMetadata, base))
+	}
+	return stateSet
 }

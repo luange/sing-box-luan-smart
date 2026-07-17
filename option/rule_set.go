@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
@@ -18,12 +19,12 @@ import (
 )
 
 type _RuleSet struct {
-	Type          string        `json:"type,omitempty"`
-	Tag           string        `json:"tag"`
-	Format        string        `json:"format,omitempty"`
-	Path          string        `json:"path,omitempty"`
-	InlineOptions PlainRuleSet  `json:"-"`
-	RemoteOptions RemoteRuleSet `json:"-"`
+	Type          string                     `json:"type,omitempty"`
+	Tag           badoption.Listable[string] `json:"tag"`
+	Format        string                     `json:"format,omitempty"`
+	InlineOptions PlainRuleSet               `json:"-"`
+	LocalOptions  LocalRuleSet               `json:"-"`
+	RemoteOptions RemoteRuleSet              `json:"-"`
 }
 
 type RuleSet _RuleSet
@@ -33,7 +34,7 @@ func (r RuleSet) MarshalJSON() ([]byte, error) {
 		var defaultFormat string
 		switch r.Type {
 		case C.RuleSetTypeLocal:
-			defaultFormat = ruleSetDefaultFormat(r.Path)
+			defaultFormat = ruleSetDefaultFormat(r.LocalOptions.Path)
 		case C.RuleSetTypeRemote:
 			defaultFormat = ruleSetDefaultFormat(r.RemoteOptions.URL)
 		}
@@ -47,7 +48,7 @@ func (r RuleSet) MarshalJSON() ([]byte, error) {
 		r.Type = ""
 		v = r.InlineOptions
 	case C.RuleSetTypeLocal:
-		v = nil
+		v = r.LocalOptions
 	case C.RuleSetTypeRemote:
 		v = r.RemoteOptions
 	default:
@@ -61,7 +62,7 @@ func (r *RuleSet) UnmarshalJSON(bytes []byte) error {
 	if err != nil {
 		return err
 	}
-	if r.Tag == "" {
+	if len(r.Tag) == 0 || common.Any(r.Tag, func(tag string) bool { return tag == "" }) {
 		return E.New("missing tag")
 	}
 	var v any
@@ -70,7 +71,7 @@ func (r *RuleSet) UnmarshalJSON(bytes []byte) error {
 		r.Type = C.RuleSetTypeInline
 		v = &r.InlineOptions
 	case C.RuleSetTypeLocal:
-		v = nil
+		v = &r.LocalOptions
 	case C.RuleSetTypeRemote:
 		v = &r.RemoteOptions
 	default:
@@ -84,7 +85,7 @@ func (r *RuleSet) UnmarshalJSON(bytes []byte) error {
 		if r.Format == "" {
 			switch r.Type {
 			case C.RuleSetTypeLocal:
-				r.Format = ruleSetDefaultFormat(r.Path)
+				r.Format = ruleSetDefaultFormat(r.LocalOptions.Path)
 			case C.RuleSetTypeRemote:
 				r.Format = ruleSetDefaultFormat(r.RemoteOptions.URL)
 			}
@@ -97,8 +98,21 @@ func (r *RuleSet) UnmarshalJSON(bytes []byte) error {
 			return E.New("unknown rule-set format: " + r.Format)
 		}
 	} else {
-		r.Format = C.RuleSetFormatSource
-		r.Path = ""
+		r.Format = ""
+	}
+	if len(r.Tag) > 1 {
+		switch r.Type {
+		case C.RuleSetTypeInline:
+			return E.New("inline rule-set does not support multiple tags")
+		case C.RuleSetTypeLocal:
+			if !strings.Contains(r.LocalOptions.Path, C.RuleSetTagPlaceholder) {
+				return E.New("missing ", C.RuleSetTagPlaceholder, " placeholder in path")
+			}
+		case C.RuleSetTypeRemote:
+			if !strings.Contains(r.RemoteOptions.URL, C.RuleSetTagPlaceholder) {
+				return E.New("missing ", C.RuleSetTagPlaceholder, " placeholder in url")
+			}
+		}
 	}
 	return nil
 }
@@ -115,6 +129,10 @@ func ruleSetDefaultFormat(path string) string {
 	default:
 		return ""
 	}
+}
+
+type LocalRuleSet struct {
+	Path string `json:"path,omitempty"`
 }
 
 type RemoteRuleSet struct {
@@ -203,7 +221,6 @@ type DefaultHeadlessRule struct {
 	NetworkIsConstrained    bool                                                                        `json:"network_is_constrained,omitempty"`
 	WIFISSID                badoption.Listable[string]                                                  `json:"wifi_ssid,omitempty"`
 	WIFIBSSID               badoption.Listable[string]                                                  `json:"wifi_bssid,omitempty"`
-	DomainMatchStrategy     DomainMatchStrategy                                                         `json:"domain_match_strategy,omitempty"`
 	NetworkInterfaceAddress *badjson.TypedMap[InterfaceType, badoption.Listable[*badoption.Prefixable]] `json:"network_interface_address,omitempty"`
 	DefaultInterfaceAddress badoption.Listable[*badoption.Prefixable]                                   `json:"default_interface_address,omitempty"`
 
@@ -224,10 +241,9 @@ func (r DefaultHeadlessRule) IsValid() bool {
 }
 
 type LogicalHeadlessRule struct {
-	Mode                string              `json:"mode"`
-	Rules               []HeadlessRule      `json:"rules,omitempty"`
-	DomainMatchStrategy DomainMatchStrategy `json:"domain_match_strategy,omitempty"`
-	Invert              bool                `json:"invert,omitempty"`
+	Mode   string         `json:"mode"`
+	Rules  []HeadlessRule `json:"rules,omitempty"`
+	Invert bool           `json:"invert,omitempty"`
 }
 
 func (r LogicalHeadlessRule) IsValid() bool {

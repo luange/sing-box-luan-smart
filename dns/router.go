@@ -43,7 +43,7 @@ type Router struct {
 	rules                 []adapter.DNSRule
 	ruleByUUID            map[string]adapter.DNSRule
 	defaultDomainStrategy C.DomainStrategy
-	dnsReverseMapping     freelru.Cache[netip.Addr, string]
+	dnsReverseMapping     *freelru.Cache[netip.Addr, string]
 	platformInterface     adapter.PlatformInterface
 	legacyDNSMode         bool
 	rulesAccess           sync.RWMutex
@@ -118,7 +118,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		Logger: router.logger,
 	})
 	if options.ReverseMapping {
-		router.dnsReverseMapping = common.Must1(freelru.NewSharded[netip.Addr, string](1024, maphash.NewHasher[netip.Addr]().Hash32))
+		router.dnsReverseMapping = common.Must1(freelru.New[netip.Addr, string](1024, maphash.NewHasher[netip.Addr]().Hash32, true))
 	}
 	return router, nil
 }

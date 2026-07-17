@@ -1,3 +1,9 @@
+!!! quote "Changes in sing-box 1.14.0"
+
+    :material-plus: [udp_mapping](/configuration/shared/udp-nat/#udp_mapping)  
+    :material-plus: [udp_filtering](/configuration/shared/udp-nat/#udp_filtering)  
+    :material-plus: [udp_nat_max](/configuration/shared/udp-nat/#udp_nat_max)
+
 !!! question "Since sing-box 1.11.0"
 
 ### Structure
@@ -9,7 +15,6 @@
   
   "system": false,
   "name": "",
-  "gso": false,
   "mtu": 1408,
   "address": [],
   "private_key": "",
@@ -25,9 +30,10 @@
       "reserved": [0, 0, 0]
     }
   ],
-  "udp_timeout": "",
+
+  ... // UDP NAT Fields
+
   "workers": 0,
-  "inner_domain_resolver": "", // or {}
  
   ... // Dial Fields
 }
@@ -48,16 +54,6 @@ Requires privilege and cannot conflict with exists system interfaces.
 #### name
 
 Custom interface name for system interface.
-
-#### gso
-
-!!! quote ""
-
-    Only supported on Linux.
-
-Try to enable generic segmentation offload.
-
-Enabled by default when `system` is true.
 
 #### mtu
 
@@ -124,25 +120,15 @@ Disabled by default.
 
 WireGuard reserved field bytes.
 
-#### udp_timeout
-
-UDP NAT expiration time.
-
-`5m` will be used by default.
-
 #### workers
 
 WireGuard worker count.
 
 CPU count is used by default.
 
-#### inner_domain_resolver
+### UDP NAT Fields
 
-Set domain resolver for resolving domain names of connections passing through the WireGuard tunnel.
-
-This option uses the same format as [domain_resolver](/configuration/shared/dial/#domain_resolver).
-
-When not set, the default DNS is used.
+See [UDP NAT Fields](/configuration/shared/udp-nat/) for details.
 
 ### Dial Fields
 

@@ -1,3 +1,9 @@
+!!! quote "sing-box 1.14.0 中的更改"
+
+    :material-plus: [udp_mapping](/zh/configuration/shared/udp-nat/#udp_mapping)  
+    :material-plus: [udp_filtering](/zh/configuration/shared/udp-nat/#udp_filtering)  
+    :material-plus: [udp_nat_max](/zh/configuration/shared/udp-nat/#udp_nat_max)
+
 !!! question "自 sing-box 1.11.0 起"
 
 ### 结构
@@ -9,7 +15,6 @@
 
   "system": false,
   "name": "",
-  "gso": false,
   "mtu": 1408,
   "address": [],
   "private_key": "",
@@ -25,9 +30,10 @@
       "reserved": [0, 0, 0]
     }
   ],
-  "udp_timeout": "",
+
+  ... // UDP NAT 字段
+
   "workers": 0,
-  "inner_domain_resolver": "", // 或 {}
 
   ... // 拨号字段
 }
@@ -48,16 +54,6 @@
 #### name
 
 为系统接口自定义设备名称。
-
-#### gso
-
-!!! quote ""
-
-    仅支持 Linux。
-
-尝试启用通用分段卸载。
-
-当 `system` 为 true 时，默认启用。
 
 #### mtu
 
@@ -126,25 +122,15 @@ WireGuard 对等方的列表。
 
 对等方的保留字段字节。
 
-#### udp_timeout
-
-UDP NAT 过期时间。
-
-默认使用 `5m`。
-
 #### workers
 
 WireGuard worker 数量。
 
 默认使用 CPU 数量。
 
-#### inner_domain_resolver
+### UDP NAT 字段
 
-设置用于解析通过 WireGuard 隊道的连接的域名解析器。
-
-此选项与 [domain_resolver](/zh/configuration/shared/dial/#domain_resolver) 格式相同。
-
-未设置时使用默认DNS。
+参阅 [UDP NAT 字段](/zh/configuration/shared/udp-nat/)。
 
 ### 拨号字段
 
