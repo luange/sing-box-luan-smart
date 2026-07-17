@@ -43,6 +43,9 @@ const (
 	defaultSmartProbeTimeout      = 5 * time.Second
 	defaultSmartAttemptTimeout    = 4 * time.Second
 	defaultSmartSiteStickiness    = 10 * time.Minute
+	defaultSmartHedgeDelay        = 450 * time.Millisecond
+	minSmartHedgeDelay            = 250 * time.Millisecond
+	maxSmartHedgeDelay            = 750 * time.Millisecond
 	defaultSmartSwitchMargin      = 0.08
 	defaultSmartExploration       = 0.08
 	defaultSmartMinSamples        = 3
@@ -83,6 +86,21 @@ type smartRanking struct {
 	candidates      []adapter.Outbound
 	rankBuffer      *[]smartRank
 	candidateBuffer *[]adapter.Outbound
+}
+
+type smartDialAttempt struct {
+	rankIndex    int
+	attemptIndex int
+	rank         smartRank
+	candidate    adapter.Outbound
+	reserved     bool
+}
+
+type smartDialResult struct {
+	attempt smartDialAttempt
+	conn    net.Conn
+	err     error
+	elapsed time.Duration
 }
 
 var smartRankPool = sync.Pool{New: func() any {
@@ -692,11 +710,44 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if !hasEligibleSmartRank(ranks) {
 		return nil, E.New("smart group has no service-reachable candidate")
 	}
-	var attemptErrors []error
-	attemptCount := 0
+	attempts := s.collectDialAttempts(ranks, networkKey, siteKey, transport)
+	if len(attempts) == 0 {
+		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates are circuit-open or recovery-busy")
+		return nil, E.New("all smart candidates are circuit-open or recovery-busy")
+	}
+	if conn, result, attemptErrors, ok := s.dialContextAdaptive(ctx, network, destination, attempts, networkKey, siteKey, transport); ok {
+		candidate := result.attempt.candidate
+		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, result.attempt.attemptIndex)
+		if metadata := adapter.ContextFrom(ctx); metadata != nil {
+			metadata.AppendRealOutbound(candidate.Tag())
+		}
+		conn = s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx))
+		return newSmartObservedConn(conn, time.Now().Add(-result.elapsed), func(firstByte time.Duration) {
+			s.store.observeFirstByte(time.Now(), networkKey, siteKey, candidate.Tag(), transport, firstByte)
+		}, func(bytes int64, duration time.Duration) {
+			s.store.observeThroughput(time.Now(), networkKey, siteKey, candidate.Tag(), transport, bytes, duration)
+		}), nil
+	} else {
+		s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates failed")
+		if len(attemptErrors) == 0 {
+			return nil, E.New("all smart candidates are circuit-open or recovery-busy")
+		}
+		return nil, errors.Join(attemptErrors...)
+	}
+}
+
+func (s *Smart) collectDialAttempts(ranks []smartRank, networkKey, siteKey, transport string) []smartDialAttempt {
+	maxAttempts := s.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultSmartMaxAttempts
+	}
+	attempts := make([]smartDialAttempt, 0, min(maxAttempts, len(ranks)))
 	for rankIndex := range ranks {
+		if len(attempts) >= maxAttempts {
+			break
+		}
 		rank := ranks[rankIndex]
-		if !rank.eligible || rank.status.State == "open" || attemptCount >= s.maxAttempts {
+		if !rank.eligible || rank.status.State == "open" {
 			continue
 		}
 		reserved := s.reserveHalfOpen(rank, networkKey, siteKey, transport)
@@ -704,45 +755,137 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 			continue
 		}
 		candidate := rank.outbound
-		attemptIndex := attemptCount
-		attemptCount++
-		startedAt := time.Now()
-		attemptCtx := ctx
-		var cancel context.CancelFunc
-		if s.attemptTimeout > 0 {
-			attemptCtx, cancel = context.WithTimeout(ctx, s.attemptTimeout)
-		}
-		conn, err := candidate.DialContext(attemptCtx, network, destination)
-		if cancel != nil {
-			cancel()
-		}
-		if reserved {
-			s.releaseHalfOpen(candidate.Tag(), networkKey, siteKey, transport)
-		}
-		elapsed := time.Since(startedAt)
-		if err != nil {
-			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, elapsed)
-			s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
-			attemptErrors = append(attemptErrors, E.Cause(err, "smart candidate ", candidate.Tag()))
-			continue
-		}
-		s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, elapsed)
-		s.markSelected(candidate, networkKey, siteKey, siteDisplay, transport, ranks, attemptIndex)
-		if metadata := adapter.ContextFrom(ctx); metadata != nil {
-			metadata.AppendRealOutbound(candidate.Tag())
-		}
-		conn = s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx))
-		return newSmartObservedConn(conn, startedAt, func(firstByte time.Duration) {
-			s.store.observeFirstByte(time.Now(), networkKey, siteKey, candidate.Tag(), transport, firstByte)
-		}, func(bytes int64, duration time.Duration) {
-			s.store.observeThroughput(time.Now(), networkKey, siteKey, candidate.Tag(), transport, bytes, duration)
-		}), nil
+		attempts = append(attempts, smartDialAttempt{
+			rankIndex:    rankIndex,
+			attemptIndex: len(attempts),
+			rank:         rank,
+			candidate:    candidate,
+			reserved:     reserved,
+		})
 	}
-	s.updateStatusSelected(networkKey, siteDisplay, transport, ranks, "", "all eligible candidates failed")
-	if len(attemptErrors) == 0 {
-		return nil, E.New("all smart candidates are circuit-open or recovery-busy")
+	return attempts
+}
+
+func (s *Smart) dialContextAdaptive(ctx context.Context, network string, destination M.Socksaddr, attempts []smartDialAttempt, networkKey, siteKey, transport string) (net.Conn, smartDialResult, []error, bool) {
+	parentCtx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll()
+	results := make(chan smartDialResult, len(attempts))
+	startAttempt := func(attempt smartDialAttempt) {
+		go func() {
+			startedAt := time.Now()
+			attemptCtx := parentCtx
+			var cancel context.CancelFunc
+			if s.attemptTimeout > 0 {
+				attemptCtx, cancel = context.WithTimeout(parentCtx, s.attemptTimeout)
+			}
+			conn, err := attempt.candidate.DialContext(attemptCtx, network, destination)
+			if cancel != nil {
+				cancel()
+			}
+			if attempt.reserved {
+				s.releaseHalfOpen(attempt.candidate.Tag(), networkKey, siteKey, transport)
+			}
+			elapsed := time.Since(startedAt)
+			if err == nil && parentCtx.Err() != nil {
+				conn.Close()
+				return
+			}
+			results <- smartDialResult{attempt: attempt, conn: conn, err: err, elapsed: elapsed}
+		}()
 	}
-	return nil, errors.Join(attemptErrors...)
+
+	started := 0
+	active := 0
+	startAttempt(attempts[started])
+	started++
+	active++
+
+	var hedgeTimer *time.Timer
+	var hedgeC <-chan time.Time
+	resetHedge := func() {
+		if started >= len(attempts) || active == 0 {
+			if hedgeTimer != nil {
+				hedgeTimer.Stop()
+			}
+			hedgeC = nil
+			return
+		}
+		delay := s.smartHedgeDelay()
+		if delay <= 0 {
+			hedgeC = nil
+			return
+		}
+		if hedgeTimer == nil {
+			hedgeTimer = time.NewTimer(delay)
+		} else {
+			if !hedgeTimer.Stop() {
+				select {
+				case <-hedgeTimer.C:
+				default:
+				}
+			}
+			hedgeTimer.Reset(delay)
+		}
+		hedgeC = hedgeTimer.C
+	}
+	stopHedge := func() {
+		if hedgeTimer != nil {
+			hedgeTimer.Stop()
+		}
+	}
+	defer stopHedge()
+	resetHedge()
+
+	var attemptErrors []error
+	for active > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, smartDialResult{}, append(attemptErrors, ctx.Err()), false
+		case <-hedgeC:
+			if started < len(attempts) {
+				startAttempt(attempts[started])
+				started++
+				active++
+			}
+			resetHedge()
+		case result := <-results:
+			active--
+			candidate := result.attempt.candidate
+			if result.err != nil {
+				s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, false, result.elapsed)
+				s.clearBrokenPin(candidate.Tag(), networkKey, siteKey, transport)
+				attemptErrors = append(attemptErrors, E.Cause(result.err, "smart candidate ", candidate.Tag()))
+				if started < len(attempts) {
+					startAttempt(attempts[started])
+					started++
+					active++
+				}
+				resetHedge()
+				continue
+			}
+			s.store.observeDial(time.Now(), networkKey, siteKey, candidate.Tag(), transport, true, result.elapsed)
+			cancelAll()
+			return result.conn, result, attemptErrors, true
+		}
+	}
+	return nil, smartDialResult{}, attemptErrors, false
+}
+
+func (s *Smart) smartHedgeDelay() time.Duration {
+	if s.maxAttempts <= 1 {
+		return 0
+	}
+	if s.attemptTimeout <= 0 {
+		return defaultSmartHedgeDelay
+	}
+	delay := s.attemptTimeout / 3
+	if delay < minSmartHedgeDelay {
+		return minSmartHedgeDelay
+	}
+	if delay > maxSmartHedgeDelay {
+		return maxSmartHedgeDelay
+	}
+	return delay
 }
 
 func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

@@ -23,6 +23,7 @@ import (
 type smartFakeOutbound struct {
 	outbound.Adapter
 	dialError error
+	dialDelay time.Duration
 	dials     atomic.Int64
 	peers     chan net.Conn
 }
@@ -118,6 +119,15 @@ func newSmartFakeOutboundNetworks(tag string, networks []string, dialError error
 
 func (f *smartFakeOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	f.dials.Add(1)
+	if f.dialDelay > 0 {
+		timer := time.NewTimer(f.dialDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	if f.dialError != nil {
 		return nil, f.dialError
 	}
@@ -178,6 +188,32 @@ func TestSmartDialFailsOverWithinSameRequest(t *testing.T) {
 	}
 	if smart.Now() != "second" {
 		t.Fatalf("expected second selected, got %q", smart.Now())
+	}
+}
+
+func TestSmartDialHedgesSlowCandidateWithinSameRequest(t *testing.T) {
+	first := newSmartFakeOutbound("first", nil)
+	first.dialDelay = 400 * time.Millisecond
+	second := newSmartFakeOutbound("second", nil)
+	smart := newTestSmart(first, second)
+	smart.attemptTimeout = 900 * time.Millisecond
+
+	startedAt := time.Now()
+	conn, err := smart.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if elapsed := time.Since(startedAt); elapsed >= first.dialDelay {
+		t.Fatalf("Smart waited for slow candidate instead of hedging: elapsed=%s", elapsed)
+	}
+	peer := <-second.peers
+	defer peer.Close()
+	if first.dials.Load() != 1 || second.dials.Load() != 1 {
+		t.Fatalf("unexpected dial counts: first=%d second=%d", first.dials.Load(), second.dials.Load())
+	}
+	if smart.Now() != "second" {
+		t.Fatalf("expected hedged candidate selected, got %q", smart.Now())
 	}
 }
 
