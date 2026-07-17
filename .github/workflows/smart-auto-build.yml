@@ -50,7 +50,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BUILD_TAGS: with_gvisor,with_quic,with_dhcp,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_purego
+  BUILD_TAGS: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_purego
   GOFLAGS: -mod=mod
   UPSTREAM_REMOTE: https://github.com/SagerNet/sing-box.git
 
@@ -134,6 +134,16 @@ jobs:
           go test ./protocol/group ./route/rule ./dns \
             -run 'TestSmartDial(FailsOver|Hedges)|TestSmartTemporaryOverride|TestSmartReach|Test.*RuleSet|Test' \
             -count=1 -timeout=180s
+
+      - name: Compile WireGuard feature set
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' -tags "$BUILD_TAGS" \
+            ./cmd/sing-box \
+            ./common/dialer \
+            ./protocol/wireguard \
+            ./transport/wireguard
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
