@@ -27,6 +27,7 @@ import (
 var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
+	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
 )
 
 func RegisterEndpoint(registry *endpoint.Registry) {
@@ -73,6 +74,10 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
+	gso := options.System
+	if options.GSO != nil {
+		gso = *options.GSO
+	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	var egressPool *tun.UDPEgressPool
 	wireGuardListener, isWireGuardListener := common.Cast[dialer.WireGuardListener](outboundDialer)
@@ -95,6 +100,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		Context:         ctx,
 		Logger:          logger,
 		System:          options.System,
+		GSO:             gso,
 		Handler:         ep,
 		UDPTimeout:      udpTimeout,
 		ICMPTimeout:     C.ICMPTimeout,
@@ -157,6 +163,16 @@ func (w *Endpoint) Start(stage adapter.StartStage) error {
 func (w *Endpoint) Close() error {
 	w.started.Store(false)
 	return w.endpoint.Close()
+}
+
+func (w *Endpoint) InterfaceUpdated() {
+	if !w.started.Load() {
+		return
+	}
+	err := w.endpoint.BindUpdate()
+	if err != nil {
+		w.logger.Warn(E.Cause(err, "update WireGuard bind"))
+	}
 }
 
 func (w *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
