@@ -91,7 +91,7 @@ func (w *systemDevice) Start() error {
 			return it.Addr().Is6()
 		}),
 		MTU:            w.options.MTU,
-		GSO:            w.options.GSO,
+		GSO:            true,
 		InterfaceScope: true,
 		Inet4RouteAddress: common.Filter(w.options.AllowedAddress, func(it netip.Prefix) bool {
 			return it.Addr().Is4()
