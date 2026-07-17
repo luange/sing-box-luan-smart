@@ -1,6 +1,24 @@
 name: Smart Core Auto Build
 
-on:
+'on':
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/smart-auto-build.yml"
+      - "adapter/**"
+      - "cmd/**"
+      - "common/**"
+      - "constant/**"
+      - "dns/**"
+      - "experimental/**"
+      - "go.mod"
+      - "go.sum"
+      - "option/**"
+      - "protocol/**"
+      - "provider/**"
+      - "route/**"
+      - "transport/**"
   workflow_dispatch:
     inputs:
       upstream_tag:
