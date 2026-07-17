@@ -642,7 +642,7 @@ func strategyConsistentHashing(g *LoadBalanceGroup, url string) strategyFn {
 
 func strategyStickySessions(g *LoadBalanceGroup, url string) strategyFn {
 	maxRetry := 5
-	lruCache := common.Must1(freelru.NewSharded[uint64, int](1000, maphash.NewHasher[uint64]().Hash32))
+	lruCache := common.Must1(freelru.New[uint64, int](1000, maphash.NewHasher[uint64]().Hash32, true))
 	lruCache.SetLifetime(g.ttl)
 	hash := maphash.NewHasher[string]()
 	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {

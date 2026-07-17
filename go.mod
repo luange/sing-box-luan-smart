@@ -81,7 +81,6 @@ require (
 
 replace (
 	github.com/sagernet/sing-snell => github.com/reF1nd/sing-snell v0.0.0-20260713132549-9711346e2b35
-	github.com/sagernet/sing-tun => github.com/reF1nd/sing-tun v0.8.12-0.20260715065124-bd80020832b2
 )
 
 require (

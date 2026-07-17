@@ -110,8 +110,8 @@ type Client struct {
 	dnsCache          adapter.DNSCacheStore
 	initDNSCacheFunc  func() adapter.DNSCacheStore
 	logger            logger.ContextLogger
-	cache             freelru.Cache[dnsCacheKey, *dnsMsg]
-	roundRobinIndex   freelru.Cache[dnsCacheKey, *dnsMsg]
+	cache             *freelru.Cache[dnsCacheKey, *dnsMsg]
+	roundRobinIndex   *freelru.Cache[dnsCacheKey, *dnsMsg]
 	cacheLock         compatible.Map[dnsCacheKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
 }
@@ -228,7 +228,7 @@ func (c *Client) Start() {
 			c.initializeMemoryCache()
 		}
 		if c.roundRobinCache {
-			c.roundRobinIndex = common.Must1(freelru.NewSharded[dnsCacheKey, *dnsMsg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32))
+			c.roundRobinIndex = common.Must1(freelru.New[dnsCacheKey, *dnsMsg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32, true))
 		}
 	}
 }
@@ -237,7 +237,7 @@ func (c *Client) initializeMemoryCache() {
 	if c.disableCache || c.cache != nil {
 		return
 	}
-	c.cache = common.Must1(freelru.NewSharded[dnsCacheKey, *dnsMsg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32))
+	c.cache = common.Must1(freelru.New[dnsCacheKey, *dnsMsg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32, true))
 }
 
 func extractNegativeTTL(response *dns.Msg) (uint32, bool) {

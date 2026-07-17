@@ -75,8 +75,34 @@ func (s *RemoteRuleSet) Name() string {
 	return s.tag
 }
 
+func (s *RemoteRuleSet) Type() string {
+	return C.RuleSetTypeRemote
+}
+
+func (s *RemoteRuleSet) Format() string {
+	return s.options.Format
+}
+
+func (s *RemoteRuleSet) UpdatedTime() time.Time {
+	return s.lastUpdated
+}
+
+func (s *RemoteRuleSet) Update(ctx context.Context) error {
+	return s.fetch(ctx, false)
+}
+
 func (s *RemoteRuleSet) String() string {
 	return strings.Join(F.MapToString(s.rules), " ")
+}
+
+func (s *RemoteRuleSet) RuleCount() uint64 {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	var count uint64
+	for _, rule := range s.rules {
+		count += rule.RuleCount()
+	}
+	return count
 }
 
 func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
@@ -194,12 +220,16 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 }
 
 func (s *RemoteRuleSet) updateOnce() {
-	err := s.fetch(s.ctx, false)
+	err := s.Update(s.ctx)
 	if err != nil {
 		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
 	} else if s.refs.Load() == 0 {
 		s.rules = nil
 	}
+}
+
+func (s *RemoteRuleSet) update() {
+	s.updateOnce()
 }
 
 func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {

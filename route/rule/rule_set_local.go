@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
@@ -26,16 +27,18 @@ import (
 var _ adapter.RuleSet = (*LocalRuleSet)(nil)
 
 type LocalRuleSet struct {
-	ctx        context.Context
-	logger     logger.Logger
-	tag        string
-	access     sync.RWMutex
-	rules      []adapter.HeadlessRule
-	metadata   adapter.RuleSetMetadata
-	fileFormat string
-	watcher    *fswatch.Watcher
-	callbacks  list.List[adapter.RuleSetUpdateCallback]
-	refs       atomic.Int32
+	ctx         context.Context
+	logger      logger.Logger
+	tag         string
+	access      sync.RWMutex
+	rules       []adapter.HeadlessRule
+	metadata    adapter.RuleSetMetadata
+	ruleType    string
+	fileFormat  string
+	lastUpdated time.Time
+	watcher     *fswatch.Watcher
+	callbacks   list.List[adapter.RuleSetUpdateCallback]
+	refs        atomic.Int32
 }
 
 func NewLocalRuleSet(ctx context.Context, logger logger.Logger, tag string, options option.RuleSet) (*LocalRuleSet, error) {
@@ -43,6 +46,7 @@ func NewLocalRuleSet(ctx context.Context, logger logger.Logger, tag string, opti
 		ctx:        ctx,
 		logger:     logger,
 		tag:        tag,
+		ruleType:   options.Type,
 		fileFormat: options.Format,
 	}
 	if options.Type == C.RuleSetTypeInline {
@@ -81,8 +85,34 @@ func (s *LocalRuleSet) Name() string {
 	return s.tag
 }
 
+func (s *LocalRuleSet) Type() string {
+	return s.ruleType
+}
+
+func (s *LocalRuleSet) Format() string {
+	return s.fileFormat
+}
+
+func (s *LocalRuleSet) UpdatedTime() time.Time {
+	return s.lastUpdated
+}
+
+func (s *LocalRuleSet) Update(ctx context.Context) error {
+	return nil
+}
+
 func (s *LocalRuleSet) String() string {
 	return strings.Join(F.MapToString(s.rules), " ")
+}
+
+func (s *LocalRuleSet) RuleCount() uint64 {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	var count uint64
+	for _, rule := range s.rules {
+		count += rule.RuleCount()
+	}
+	return count
 }
 
 func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
@@ -145,6 +175,7 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
 	s.access.Lock()
 	s.rules = rules
 	s.metadata = metadata
+	s.lastUpdated = time.Now()
 	callbacks := s.callbacks.Array()
 	s.access.Unlock()
 	for _, callback := range callbacks {

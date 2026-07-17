@@ -200,6 +200,7 @@ func (r HeadlessRule) IsValid() bool {
 
 type DefaultHeadlessRule struct {
 	QueryType               badoption.Listable[DNSQueryType]                                            `json:"query_type,omitempty"`
+	DomainMatchStrategy     DomainMatchStrategy                                                         `json:"domain_match_strategy,omitempty"`
 	Network                 badoption.Listable[string]                                                  `json:"network,omitempty"`
 	Domain                  badoption.Listable[string]                                                  `json:"domain,omitempty"`
 	DomainSuffix            badoption.Listable[string]                                                  `json:"domain_suffix,omitempty"`
@@ -241,9 +242,10 @@ func (r DefaultHeadlessRule) IsValid() bool {
 }
 
 type LogicalHeadlessRule struct {
-	Mode   string         `json:"mode"`
-	Rules  []HeadlessRule `json:"rules,omitempty"`
-	Invert bool           `json:"invert,omitempty"`
+	Mode                string              `json:"mode"`
+	Rules               []HeadlessRule      `json:"rules,omitempty"`
+	DomainMatchStrategy DomainMatchStrategy `json:"domain_match_strategy,omitempty"`
+	Invert              bool                `json:"invert,omitempty"`
 }
 
 func (r LogicalHeadlessRule) IsValid() bool {
