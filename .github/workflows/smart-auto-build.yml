@@ -51,6 +51,7 @@ concurrency:
 
 env:
   BUILD_TAGS: with_clash_api,with_utls
+  GOFLAGS: -mod=mod
   UPSTREAM_REMOTE: https://github.com/SagerNet/sing-box.git
 
 jobs:
