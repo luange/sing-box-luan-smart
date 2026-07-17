@@ -1,0 +1,205 @@
+name: Smart Core Auto Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Official SagerNet tag to merge/build, e.g. v1.14.0-alpha.46. Leave empty for latest."
+        required: false
+        type: string
+      custom_suffix:
+        description: "Custom version suffix"
+        required: false
+        default: "reF1nd-luan-smart"
+        type: string
+      publish_release:
+        description: "Create a GitHub release with built artifacts"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "20 3 * * *"
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: smart-core-auto-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_TAGS: with_clash_api,with_utls
+  UPSTREAM_REMOTE: https://github.com/SagerNet/sing-box.git
+
+jobs:
+  resolve:
+    name: Resolve upstream tag
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ inputs.upstream_tag }}" ]]; then
+            upstream_tag="${{ inputs.upstream_tag }}"
+          else
+            upstream_tag="$(python3 - <<'PY'
+import json, urllib.request
+with urllib.request.urlopen("https://api.github.com/repos/SagerNet/sing-box/releases?per_page=1", timeout=30) as response:
+    print(json.load(response)[0]["tag_name"])
+PY
+)"
+          fi
+          suffix="${{ inputs.custom_suffix }}"
+          if [[ -z "$suffix" ]]; then
+            suffix="reF1nd-luan-smart"
+          fi
+          version="${upstream_tag#v}-${suffix}"
+          release_tag="v${version}"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$upstream_tag"
+          echo "version=$version"
+          echo "release_tag=$release_tag"
+
+  test:
+    name: Merge and test
+    runs-on: ubuntu-latest
+    needs: resolve
+    steps:
+      - name: Checkout smart branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch official upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add sagernet "$UPSTREAM_REMOTE" 2>/dev/null || git remote set-url sagernet "$UPSTREAM_REMOTE"
+          git fetch --force sagernet "refs/tags/${{ needs.resolve.outputs.upstream_tag }}:refs/tags/${{ needs.resolve.outputs.upstream_tag }}"
+
+      - name: Merge official upstream tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "smart-build-bot"
+          git config user.email "smart-build-bot@users.noreply.github.com"
+          if git merge-base --is-ancestor "${{ needs.resolve.outputs.upstream_tag }}" HEAD; then
+            echo "Already contains ${{ needs.resolve.outputs.upstream_tag }}"
+          else
+            git merge --no-edit "${{ needs.resolve.outputs.upstream_tag }}"
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test focused smart and compatibility packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./protocol/group ./route/rule ./dns \
+            -run 'TestSmartDial(FailsOver|Hedges)|TestSmartTemporaryOverride|TestSmartReach|Test.*RuleSet|Test' \
+            -count=1 -timeout=180s
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs:
+      - resolve
+      - test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - name: Checkout smart branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch and merge official upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add sagernet "$UPSTREAM_REMOTE" 2>/dev/null || git remote set-url sagernet "$UPSTREAM_REMOTE"
+          git fetch --force sagernet "refs/tags/${{ needs.resolve.outputs.upstream_tag }}:refs/tags/${{ needs.resolve.outputs.upstream_tag }}"
+          git config user.name "smart-build-bot"
+          git config user.email "smart-build-bot@users.noreply.github.com"
+          if git merge-base --is-ancestor "${{ needs.resolve.outputs.upstream_tag }}" HEAD; then
+            echo "Already contains ${{ needs.resolve.outputs.upstream_tag }}"
+          else
+            git merge --no-edit "${{ needs.resolve.outputs.upstream_tag }}"
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          output="sing-box-${{ needs.resolve.outputs.version }}-${GOOS}-${GOARCH}"
+          go build -trimpath -tags "$BUILD_TAGS" \
+            -ldflags "-s -w -buildid= -X github.com/sagernet/sing-box/constant.Version=${{ needs.resolve.outputs.version }}" \
+            -o "dist/${output}" ./cmd/sing-box
+          chmod +x "dist/${output}"
+          (cd dist && sha256sum "${output}" > "${output}.sha256")
+          tar -C dist -czf "dist/${output}.tar.gz" "${output}" "${output}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ needs.resolve.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs:
+      - resolve
+      - build
+    if: ${{ inputs.publish_release == true }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: sing-box-*
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          name: ${{ needs.resolve.outputs.release_tag }}
+          body: |
+            Automated Smart core build.
+
+            Upstream: ${{ needs.resolve.outputs.upstream_tag }}
+            Version: ${{ needs.resolve.outputs.version }}
+            Build tags: `${{ env.BUILD_TAGS }}`
+          files: artifacts/*.tar.gz
